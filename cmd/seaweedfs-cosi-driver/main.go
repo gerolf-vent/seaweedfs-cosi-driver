@@ -20,15 +20,21 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
+	"io/ioutil"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/seaweedfs/seaweedfs-cosi-driver/pkg/driver"
 	"github.com/seaweedfs/seaweedfs-cosi-driver/pkg/envflag"
-	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/container-object-storage-interface-provisioner-sidecar/pkg/provisioner"
 )
@@ -65,7 +71,7 @@ func run(ctx context.Context, opts runOptions) error {
 
 	// TLS creds for the client
 	util.LoadConfiguration("security", false)
-	dialOpt := security.LoadClientTLS(util.GetViper(), "grpc.client")
+	dialOpt := loadClientTLS()
 
 	idSrv, provSrv, err := driver.NewDriver(ctx,
 		opts.driverName,
@@ -83,4 +89,38 @@ func run(ctx context.Context, opts runOptions) error {
 		return err
 	}
 	return cosiSrv.Run(ctx)
+}
+
+func loadClientTLS() grpc.DialOption {
+	certFileName := os.Getenv("WEED_GRPC_CLIENT_CERT")
+	keyFileName := os.Getenv("WEED_GRPC_CLIENT_KEY")
+	caFileName := os.Getenv("WEED_GRPC_CA")
+
+	if certFileName == "" || keyFileName == "" || caFileName == "" {
+		return grpc.WithTransportCredentials(insecure.NewCredentials())
+	}
+
+	// client certificate
+	cert, err := tls.LoadX509KeyPair(certFileName, keyFileName)
+	if err != nil {
+		log.Fatalf("failed to load client cert/key: %v", err)
+	}
+
+	// root CA
+	caCertPool := x509.NewCertPool()
+	if caFileName != "" {
+		caCert, err := ioutil.ReadFile(caFileName)
+		if err != nil {
+			log.Fatalf("failed to load CA: %v", err)
+		}
+		caCertPool.AppendCertsFromPEM(caCert)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		RootCAs:            caCertPool,
+		InsecureSkipVerify: true,
+	}
+
+	return grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig))
 }
