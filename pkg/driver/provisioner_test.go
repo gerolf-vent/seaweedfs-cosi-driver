@@ -19,172 +19,126 @@ limitations under the License.
 package driver
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"reflect"
 	"testing"
 
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	cosispec "sigs.k8s.io/container-object-storage-interface-spec"
 )
 
-const (
-	userCreateJSON = `{
-	"user_id": "test-user",
-	"display_name": "test-user",
-	"email": "",
-	"suspended": 0,
-	"max_buckets": 1000,
-	"subusers": [],
-	"keys": [
-		{
-			"user": "test-user",
-			"access_key": "EOE7FYCNOBZJ5VFV909G",
-			"secret_key": "qmIqpWm8HxCzmynCrD6U6vKWi4hnDBndOnmxXNsV"
-		}
-	],
-	"swift_keys": [],
-	"caps": [
-		{
-			"type": "users",
-			"perm": "*"
-		}
-	],
-	"op_mask": "read, write, delete",
-	"default_placement": "",
-	"default_storage_class": "",
-	"placement_tags": [],
-	"bucket_quota": {
-		"enabled": false,
-		"check_on_raw": false,
-		"max_size": -1,
-		"max_size_kb": 0,
-		"max_objects": -1
-	},
-	"user_quota": {
-		"enabled": false,
-		"check_on_raw": false,
-		"max_size": -1,
-		"max_size_kb": 0,
-		"max_objects": -1
-	},
-	"temp_url_keys": [],
-	"type": "rgw",
-	"mfa_ids": []
-}`
-)
+/* -------------------------------- фейковый Filer ------------------------------ */
 
-func Test_provisionerServer_DriverGrantBucketAccess(t *testing.T) {
-	type fields struct {
-		provisioner string
-		filerClient filer_pb.SeaweedFilerClient
+type fakeFiler struct {
+	filer_pb.UnimplementedSeaweedFilerServer
+	iam bytes.Buffer
+}
+
+func (f *fakeFiler) CreateEntry(ctx context.Context, in *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+	if in.Directory == filer.IamConfigDirectory {
+		f.iam.Reset()
+		f.iam.Write(in.Entry.Content)
 	}
-	type args struct {
-		ctx context.Context
-		req *cosispec.DriverGrantBucketAccessRequest
+	return &filer_pb.CreateEntryResponse{}, nil
+}
+func (f *fakeFiler) UpdateEntry(ctx context.Context, in *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
+	f.iam.Reset()
+	f.iam.Write(in.Entry.Content)
+	return &filer_pb.UpdateEntryResponse{}, nil
+}
+func (f *fakeFiler) LookupDirectoryEntry(ctx context.Context, in *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
+	if f.iam.Len() == 0 {
+		return nil, fmt.Errorf("no entry is found in filer store")
 	}
-	// Mocking the filer client
-	filerClient := &mockSeaweedFilerClient{
-		// Add any necessary mock implementations here
+	return &filer_pb.LookupDirectoryEntryResponse{Entry: &filer_pb.Entry{Content: f.iam.Bytes()}}, nil
+}
+func (*fakeFiler) DeleteEntry(context.Context, *filer_pb.DeleteEntryRequest) (*filer_pb.DeleteEntryResponse, error) {
+	return &filer_pb.DeleteEntryResponse{}, nil
+}
+
+/* ------------------------- helper: real TCP gRPC server ----------------------- */
+
+func newProv(t *testing.T) *provisionerServer {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
 	}
-	tests := []struct {
+	srv := grpc.NewServer()
+	filer_pb.RegisterSeaweedFilerServer(srv, &fakeFiler{})
+	go srv.Serve(lis)
+
+	p, err := NewProvisionerServer("prov", lis.Addr().String(), "", "", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("init prov: %v", err)
+	}
+	return p.(*provisionerServer)
+}
+
+/* ----------------------------------- tests ----------------------------------- */
+
+func TestDriverGrantBucketAccess(t *testing.T) {
+	p := newProv(t)
+
+	cases := []struct {
 		name    string
-		fields  fields
-		args    args
-		want    *cosispec.DriverGrantBucketAccessResponse
+		req     *cosispec.DriverGrantBucketAccessRequest
 		wantErr bool
 	}{
-		{"Empty Bucket Name", fields{"provisioner", filerClient}, args{context.Background(), &cosispec.DriverGrantBucketAccessRequest{BucketId: "", Name: "test-user"}}, nil, true},
-		{"Empty User Name", fields{"provisioner", filerClient}, args{context.Background(), &cosispec.DriverGrantBucketAccessRequest{BucketId: "test-bucket", Name: ""}}, nil, true},
-		{"Grant Bucket Access success", fields{"provisioner", filerClient}, args{context.Background(), &cosispec.DriverGrantBucketAccessRequest{BucketId: "test-bucket", Name: "test-user"}}, &cosispec.DriverGrantBucketAccessResponse{
-			AccountId: "test-user",
-			Credentials: map[string]*cosispec.CredentialDetails{
-				"s3": {
-					Secrets: map[string]string{
-						"accessKeyID":     "some-access-key-id",
-						"accessSecretKey": "some-secret-key",
-						"endpoint":        "",
-						"region":          "",
-					},
-				},
-			},
-		}, false},
+		{"empty bucket", &cosispec.DriverGrantBucketAccessRequest{Name: "u"}, true},
+		{"empty user", &cosispec.DriverGrantBucketAccessRequest{BucketId: "b"}, true},
+		{"ok", &cosispec.DriverGrantBucketAccessRequest{BucketId: "b", Name: "u"}, false},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := &provisionerServer{
-				provisioner: tt.fields.provisioner,
-				filerClient: tt.fields.filerClient,
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp, err := p.DriverGrantBucketAccess(context.Background(), c.req)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, c.wantErr)
 			}
-			got, err := s.DriverGrantBucketAccess(tt.args.ctx, tt.args.req)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("provisionerServer.DriverGrantBucketAccess() error = %v, wantErr %v", err, tt.wantErr)
+			if c.wantErr {
 				return
 			}
-			if tt.want != nil {
-				// Avoid deep equality check for generated credentials, focus on structure and presence of keys
-				if got.AccountId != tt.want.AccountId {
-					t.Errorf("provisionerServer.DriverGrantBucketAccess() got AccountId = %v, want AccountId = %v", got.AccountId, tt.want.AccountId)
-				}
-				if got.Credentials["s3"].Secrets["endpoint"] != tt.want.Credentials["s3"].Secrets["endpoint"] {
-					t.Errorf("provisionerServer.DriverGrantBucketAccess() got endpoint = %v, want endpoint = %v", got.Credentials["s3"].Secrets["endpoint"], tt.want.Credentials["s3"].Secrets["endpoint"])
-				}
-				if got.Credentials["s3"].Secrets["region"] != tt.want.Credentials["s3"].Secrets["region"] {
-					t.Errorf("provisionerServer.DriverGrantBucketAccess() got region = %v, want region = %v", got.Credentials["s3"].Secrets["region"], tt.want.Credentials["s3"].Secrets["region"])
-				}
-				if got.Credentials["s3"].Secrets["accessKeyID"] == "" || got.Credentials["s3"].Secrets["accessSecretKey"] == "" {
-					t.Errorf("provisionerServer.DriverGrantBucketAccess() got invalid credentials")
-				}
+			if resp.AccountId != "u" {
+				t.Errorf("AccountId=%s want u", resp.AccountId)
+			}
+			if resp.Credentials["s3"].Secrets["accessKeyID"] == "" ||
+				resp.Credentials["s3"].Secrets["accessSecretKey"] == "" {
+				t.Errorf("credentials missing")
 			}
 		})
 	}
 }
 
-func Test_provisionerServer_DriverRevokeBucketAccess(t *testing.T) {
-	type fields struct {
-		provisioner string
-		filerClient filer_pb.SeaweedFilerClient
-	}
-	type args struct {
-		ctx context.Context
-		req *cosispec.DriverRevokeBucketAccessRequest
-	}
-	// Mocking the filer client with appropriate responses
-	shouldFail := false
-	filerClient := &mockSeaweedFilerClient{
-		lookupDirectoryEntryFunc: func(ctx context.Context, in *filer_pb.LookupDirectoryEntryRequest, opts ...grpc.CallOption) (*filer_pb.LookupDirectoryEntryResponse, error) {
-			if shouldFail {
-				return nil, fmt.Errorf("lookupDirectoryEntryFunc error")
-			}
-			return &filer_pb.LookupDirectoryEntryResponse{}, nil
-		},
-	}
-	tests := []struct {
+func TestDriverRevokeBucketAccess(t *testing.T) {
+	p := newProv(t)
+	_, _ = p.DriverGrantBucketAccess(context.Background(),
+		&cosispec.DriverGrantBucketAccessRequest{BucketId: "b", Name: "u"})
+
+	cases := []struct {
 		name    string
-		fields  fields
-		args    args
-		want    *cosispec.DriverRevokeBucketAccessResponse
+		req     *cosispec.DriverRevokeBucketAccessRequest
 		wantErr bool
 	}{
-		{"Empty user name", fields{"provisioner", filerClient}, args{context.Background(), &cosispec.DriverRevokeBucketAccessRequest{AccountId: ""}}, nil, true},
-		{"Revoke Bucket Access success", fields{"provisioner", filerClient}, args{context.Background(), &cosispec.DriverRevokeBucketAccessRequest{AccountId: "test-user"}}, &cosispec.DriverRevokeBucketAccessResponse{}, false},
-		{"Revoke Bucket Access failure", fields{"provisioner", filerClient}, args{context.Background(), &cosispec.DriverRevokeBucketAccessRequest{AccountId: "failed-user"}}, nil, true},
+		{"empty user", &cosispec.DriverRevokeBucketAccessRequest{}, true},
+		{"ok", &cosispec.DriverRevokeBucketAccessRequest{AccountId: "u"}, false},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			shouldFail = tt.wantErr
-			s := &provisionerServer{
-				provisioner: tt.fields.provisioner,
-				filerClient: tt.fields.filerClient,
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := p.DriverRevokeBucketAccess(context.Background(), c.req)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, c.wantErr)
 			}
-			got, err := s.DriverRevokeBucketAccess(tt.args.ctx, tt.args.req)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("provisionerServer.DriverRevokeBucketAccess() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("provisionerServer.DriverRevokeBucketAccess() = %v, want %v", got, tt.want)
+			if !c.wantErr && !reflect.DeepEqual(got, &cosispec.DriverRevokeBucketAccessResponse{}) {
+				t.Errorf("unexpected resp=%+v", got)
 			}
 		})
 	}

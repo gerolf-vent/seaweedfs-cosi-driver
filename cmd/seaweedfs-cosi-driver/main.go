@@ -54,41 +54,33 @@ func main() {
 	}
 
 	if err := run(context.Background(), opts); err != nil {
-		klog.ErrorS(err, "exiting on error")
+		klog.ErrorS(err, "driver exited with error")
 		os.Exit(1)
 	}
 }
 
 func run(ctx context.Context, opts runOptions) error {
-	ctx, stop := signal.NotifyContext(ctx,
-		os.Interrupt,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-	)
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// TLS creds for the client
 	util.LoadConfiguration("security", false)
-	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
+	dialOpt := security.LoadClientTLS(util.GetViper(), "grpc.client")
 
-	identityServer, provisionerServer, err := driver.NewDriver(ctx,
+	idSrv, provSrv, err := driver.NewDriver(ctx,
 		opts.driverName,
 		opts.filerEndpoint,
 		opts.endpoint,
 		opts.region,
-		grpcDialOption,
+		dialOpt,
 	)
 	if err != nil {
 		return err
 	}
 
-	server, err := provisioner.NewDefaultCOSIProvisionerServer(
-		opts.cosiEndpoint,
-		identityServer,
-		provisionerServer,
-	)
+	cosiSrv, err := provisioner.NewDefaultCOSIProvisionerServer(opts.cosiEndpoint, idSrv, provSrv)
 	if err != nil {
 		return err
 	}
-
-	return server.Run(ctx)
+	return cosiSrv.Run(ctx)
 }
