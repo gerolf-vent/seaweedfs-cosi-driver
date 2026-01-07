@@ -22,12 +22,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
 	"google.golang.org/grpc"
@@ -40,6 +44,18 @@ import (
 /* -------------------------------------------------------------------------- */
 /*                               type & helpers                               */
 /* -------------------------------------------------------------------------- */
+
+const (
+	// parameterPrefix is the namespace prefix for SeaweedFS-specific BucketClass parameters
+	parameterPrefix = "seaweedfs.objectstorage.k8s.io/"
+)
+
+var (
+	replicationParameterRegex = regexp.MustCompile("^[0-9]{3}$")
+	diskTypeParameterRegex    = regexp.MustCompile("^[a-z0-9]+$")
+	ttlParameterRegex         = regexp.MustCompile("^[0-9]+[mhdwMy]$")
+	safeNameRegex             = regexp.MustCompile("^[a-zA-Z0-9._-]{1,253}$")
+)
 
 // provisionerServer implements cosi.ProvisionerServer.
 type provisionerServer struct {
@@ -129,13 +145,207 @@ func (s *provisionerServer) deleteBucket(ctx context.Context, id string) error {
 	})
 }
 
+func (s *provisionerServer) createBucketWithParameters(ctx context.Context, name string, parameters map[string]string) error {
+	// Fast path: no parameters
+	if len(parameters) == 0 {
+		return s.createBucket(ctx, name)
+	}
+
+	// Read and validate parameters
+	var replication, diskType, ttl string
+	var volumeGrowthCount uint32
+	var dataCenter, rack, dataNode string
+
+	if paramReplication, ok := parameters[parameterPrefix+"replication"]; ok {
+		if !replicationParameterRegex.MatchString(paramReplication) {
+			klog.ErrorS(nil, "invalid replication parameter", "value", paramReplication, "bucket", name)
+			return fmt.Errorf("invalid replication parameter: %q (must be empty or 3 digits like '001', '210', '100')", replication)
+		}
+		replication = paramReplication
+	}
+
+	if paramDiskType, ok := parameters[parameterPrefix+"diskType"]; ok {
+		if !diskTypeParameterRegex.MatchString(paramDiskType) {
+			klog.ErrorS(nil, "invalid diskType parameter", "value", paramDiskType, "bucket", name)
+			return fmt.Errorf("invalid diskType parameter: %q (only lower-case alphanumerical characters allowed)", replication)
+		}
+		diskType = paramDiskType
+	}
+
+	if paramTTL, ok := parameters[parameterPrefix+"ttl"]; ok {
+		if !ttlParameterRegex.MatchString(paramTTL) {
+			klog.ErrorS(nil, "invalid ttl parameter", "value", paramTTL, "bucket", name)
+			return fmt.Errorf("invalid ttl parameter: %q (must be a number followed by m, h, d, w, M, or y)", paramTTL)
+		}
+		ttl = paramTTL
+	}
+
+	if paramVGC, ok := parameters[parameterPrefix+"volumeGrowthCount"]; ok {
+		var vgc uint64
+		_, err := fmt.Sscanf(paramVGC, "%d", &vgc)
+		if err != nil || vgc > 65535 {
+			klog.ErrorS(err, "invalid volumeGrowthCount parameter", "value", paramVGC, "bucket", name)
+			return fmt.Errorf("invalid volumeGrowthCount parameter: %q (must be a number between 0 and 65535)", paramVGC)
+		}
+		volumeGrowthCount = uint32(vgc)
+	}
+
+	if paramDC, ok := parameters[parameterPrefix+"dataCenter"]; ok {
+		if !safeNameRegex.MatchString(paramDC) {
+			klog.ErrorS(nil, "invalid dataCenter parameter", "value", paramDC, "bucket", name)
+			return fmt.Errorf("invalid dataCenter parameter: %q (only alphanumerical characters, dot, underscore, hyphen allowed, max length 253)", paramDC)
+		}
+		dataCenter = paramDC
+	}
+
+	if paramRack, ok := parameters[parameterPrefix+"rack"]; ok {
+		if !safeNameRegex.MatchString(paramRack) {
+			klog.ErrorS(nil, "invalid rack parameter", "value", paramRack, "bucket", name)
+			return fmt.Errorf("invalid rack parameter: %q (only alphanumerical characters, dot, underscore, hyphen allowed, max length 253)", paramRack)
+		}
+		rack = paramRack
+	}
+
+	if paramDN, ok := parameters[parameterPrefix+"dataNode"]; ok {
+		if !safeNameRegex.MatchString(paramDN) {
+			klog.ErrorS(nil, "invalid dataNode parameter", "value", paramDN, "bucket", name)
+			return fmt.Errorf("invalid dataNode parameter: %q (only alphanumerical characters, dot, underscore, hyphen allowed, max length 253)", paramDN)
+		}
+		dataNode = paramDN
+	}
+
+	// Create PathConf for this bucket
+	bucketPath := filepath.Join(s.filerBucketsPath, name)
+
+	pathConf := &filer_pb.FilerConf_PathConf{
+		LocationPrefix:    bucketPath,
+		Collection:        name,
+		Replication:       replication,
+		DiskType:          diskType,
+		Ttl:               ttl,
+		VolumeGrowthCount: volumeGrowthCount,
+		DataCenter:        dataCenter,
+		Rack:              rack,
+		DataNode:          dataNode,
+	}
+
+	// Sync PathConf to filer.conf
+	if err := s.addFilerPathConf(ctx, pathConf); err != nil {
+		return fmt.Errorf("failed to add bucket storage parameters: %w", err)
+	}
+
+	// Finally, create the bucket directory
+	if err := s.createBucket(ctx, name); err != nil {
+		return fmt.Errorf("failed to create bucket directory: %w", err)
+	}
+
+	return nil
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          filer.conf PathConf management                    */
+/* -------------------------------------------------------------------------- */
+
+// addFilerPathConf adds or updates a PathConf entry in filer.conf.
+func (s *provisionerServer) addFilerPathConf(ctx context.Context, pathConf *filer_pb.FilerConf_PathConf) error {
+	return s.withFilerClient(ctx, func(client filer_pb.SeaweedFilerClient) error {
+		// Read current filer configuration
+		fc, err := filer.ReadFilerConf(
+			pb.ServerAddress(s.filerEndpoint),
+			s.grpcDialOption,
+			nil, // masterClient not needed
+		)
+		if err != nil {
+			// If filer.conf doesn't exist yet, create new one
+			if errors.Is(err, filer_pb.ErrNotFound) {
+				fc = filer.NewFilerConf()
+			} else {
+				return fmt.Errorf("failed to read filer conf: %w", err)
+			}
+		}
+
+		// Add the PathConf (merges with existing if present)
+		if err := fc.AddLocationConf(pathConf); err != nil {
+			return fmt.Errorf("failed to add location conf: %w", err)
+		}
+
+		// Serialize to JSON
+		var buf bytes.Buffer
+		if err := fc.ToText(&buf); err != nil {
+			return fmt.Errorf("failed to serialize filer conf: %w", err)
+		}
+
+		// Save back to filer
+		if err := filer.SaveInsideFiler(
+			client,
+			filer.DirectoryEtcSeaweedFS, // "/etc/seaweedfs"
+			filer.FilerConfName,         // "filer.conf"
+			buf.Bytes(),
+		); err != nil {
+			return fmt.Errorf("failed to save filer conf: %w", err)
+		}
+
+		klog.InfoS("configured bucket storage parameters",
+			"bucket", pathConf.LocationPrefix,
+			"replication", pathConf.Replication,
+			"diskType", pathConf.DiskType,
+			"ttl", pathConf.Ttl,
+			"volumeGrowthCount", pathConf.VolumeGrowthCount)
+
+		return nil
+	})
+}
+
+// removeFilerPathConf removes a PathConf entry from filer.conf.
+func (s *provisionerServer) removeFilerPathConf(ctx context.Context, bucketName string) error {
+	bucketPath := filepath.Join(s.filerBucketsPath, bucketName)
+
+	return s.withFilerClient(ctx, func(client filer_pb.SeaweedFilerClient) error {
+		// Read current configuration
+		fc, err := filer.ReadFilerConf(
+			pb.ServerAddress(s.filerEndpoint),
+			s.grpcDialOption,
+			nil,
+		)
+		if err != nil {
+			// If config doesn't exist, nothing to remove
+			if errors.Is(err, filer_pb.ErrNotFound) {
+				klog.InfoS("filer.conf not found, nothing to remove", "bucket", bucketPath)
+				return nil
+			}
+			return fmt.Errorf("failed to read filer conf: %w", err)
+		}
+
+		// Delete the PathConf
+		fc.DeleteLocationConf(bucketPath)
+
+		// Serialize and save
+		var buf bytes.Buffer
+		if err := fc.ToText(&buf); err != nil {
+			return fmt.Errorf("failed to serialize filer conf: %w", err)
+		}
+
+		if err := filer.SaveInsideFiler(
+			client,
+			filer.DirectoryEtcSeaweedFS,
+			filer.FilerConfName,
+			buf.Bytes(),
+		); err != nil {
+			return fmt.Errorf("failed to save filer conf: %w", err)
+		}
+
+		klog.InfoS("removed bucket storage parameters", "bucket", bucketPath)
+		return nil
+	})
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                 COSI RPCs                                  */
 /* -------------------------------------------------------------------------- */
 
 func (s *provisionerServer) DriverCreateBucket(ctx context.Context, req *cosispec.DriverCreateBucketRequest) (*cosispec.DriverCreateBucketResponse, error) {
-	klog.InfoS("creating bucket", "name", req.GetName())
-	if err := s.createBucket(ctx, req.GetName()); err != nil {
+	klog.InfoS("creating bucket", "name", req.GetName(), "parameters", req.GetParameters())
+	if err := s.createBucketWithParameters(ctx, req.GetName(), req.GetParameters()); err != nil {
 		klog.ErrorS(err, "create bucket failed")
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -145,10 +355,18 @@ func (s *provisionerServer) DriverCreateBucket(ctx context.Context, req *cosispe
 
 func (s *provisionerServer) DriverDeleteBucket(ctx context.Context, req *cosispec.DriverDeleteBucketRequest) (*cosispec.DriverDeleteBucketResponse, error) {
 	klog.InfoS("deleting bucket", "name", req.GetBucketId())
+
+	// Delete the bucket directory
 	if err := s.deleteBucket(ctx, req.GetBucketId()); err != nil {
 		klog.ErrorS(err, "delete bucket failed")
 		return nil, status.Error(codes.Internal, err.Error())
 	}
+
+	// Remove PathConf (don't fail if this doesn't work)
+	if err := s.removeFilerPathConf(ctx, req.GetBucketId()); err != nil {
+		klog.ErrorS(err, "failed to remove bucket storage parameters", "bucket", req.GetBucketId())
+	}
+
 	klog.InfoS("deleted bucket", "name", req.GetBucketId())
 	return &cosispec.DriverDeleteBucketResponse{}, nil
 }

@@ -4,3 +4,14 @@ metadata:
   name: sample-bcc
 driverName: seaweedfs.objectstorage.k8s.io
 deletionPolicy: Delete
+# You can configure some SeaweedFS path configuration per bucket. 
+# @see https://github.com/seaweedfs/seaweedfs/wiki/Path-Specific-Configuration
+#
+# parameters:
+#   seaweedfs.objectstorage.k8s.io/replication: "001"
+#   seaweedfs.objectstorage.k8s.io/diskType: "ssd"
+#   seaweedfs.objectstorage.k8s.io/ttl: "30d"
+#   seaweedfs.objectstorage.k8s.io/volumeGrowthCount: "4"
+#   seaweedfs.objectstorage.k8s.io/dataCenter: "dc1"
+#   seaweedfs.objectstorage.k8s.io/rack: "rack2"
+#   seaweedfs.objectstorage.k8s.io/dataNode: "node3"

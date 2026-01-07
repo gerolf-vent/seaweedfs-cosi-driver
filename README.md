@@ -78,3 +78,5 @@ file named: `BucketInfo` containing a json:
   }
 }
 ```
+
+You can also configure some SeaweedFS path configuration options per BucketClass which will be automatically configured for a bucket on provisioning. This includes the `replication`, `diskType` and `ttl` options and some more. You can see the full list [here](BUCKETCLASS_PARAMETERS.md). **If you use this, only one SeaweedFS COSI driver instance should be active at any time.**
