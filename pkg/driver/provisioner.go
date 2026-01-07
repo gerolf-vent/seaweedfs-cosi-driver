@@ -31,7 +31,6 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
 	"google.golang.org/grpc"
@@ -246,22 +245,32 @@ func (s *provisionerServer) createBucketWithParameters(ctx context.Context, name
 /*                          filer.conf PathConf management                    */
 /* -------------------------------------------------------------------------- */
 
+func (s *provisionerServer) readFilerConf(client filer_pb.SeaweedFilerClient) (*filer.FilerConf, error) {
+	data, err := filer.ReadInsideFiler(client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName)
+	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
+		return nil, fmt.Errorf("read %s/%s: %v", filer.DirectoryEtcSeaweedFS, filer.FilerConfName, err)
+	}
+
+	if errors.Is(err, filer_pb.ErrNotFound) {
+		return filer.NewFilerConf(), nil
+	}
+
+	fc := filer.NewFilerConf()
+	if len(data) > 0 {
+		if err := fc.LoadFromBytes(data); err != nil {
+			return nil, fmt.Errorf("parse %s/%s: %v", filer.DirectoryEtcSeaweedFS, filer.FilerConfName, err)
+		}
+	}
+	return fc, nil
+}
+
 // addFilerPathConf adds or updates a PathConf entry in filer.conf.
 func (s *provisionerServer) addFilerPathConf(ctx context.Context, pathConf *filer_pb.FilerConf_PathConf) error {
 	return s.withFilerClient(ctx, func(client filer_pb.SeaweedFilerClient) error {
 		// Read current filer configuration
-		fc, err := filer.ReadFilerConf(
-			pb.ServerAddress(s.filerEndpoint),
-			s.grpcDialOption,
-			nil, // masterClient not needed
-		)
+		fc, err := s.readFilerConf(client)
 		if err != nil {
-			// If filer.conf doesn't exist yet, create new one
-			if errors.Is(err, filer_pb.ErrNotFound) {
-				fc = filer.NewFilerConf()
-			} else {
-				return fmt.Errorf("failed to read filer conf: %w", err)
-			}
+			return fmt.Errorf("failed to read filer conf: %w", err)
 		}
 
 		// Add the PathConf (merges with existing if present)
@@ -301,18 +310,9 @@ func (s *provisionerServer) removeFilerPathConf(ctx context.Context, bucketName 
 	bucketPath := filepath.Join(s.filerBucketsPath, bucketName)
 
 	return s.withFilerClient(ctx, func(client filer_pb.SeaweedFilerClient) error {
-		// Read current configuration
-		fc, err := filer.ReadFilerConf(
-			pb.ServerAddress(s.filerEndpoint),
-			s.grpcDialOption,
-			nil,
-		)
+		// Read current filer configuration
+		fc, err := s.readFilerConf(client)
 		if err != nil {
-			// If config doesn't exist, nothing to remove
-			if errors.Is(err, filer_pb.ErrNotFound) {
-				klog.InfoS("filer.conf not found, nothing to remove", "bucket", bucketPath)
-				return nil
-			}
 			return fmt.Errorf("failed to read filer conf: %w", err)
 		}
 
