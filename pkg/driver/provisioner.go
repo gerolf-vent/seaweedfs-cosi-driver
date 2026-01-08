@@ -27,7 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
+	"slices"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
@@ -546,15 +546,6 @@ func (s *provisionerServer) configureS3Access(ctx context.Context, user, ak, sk 
 /* -------------------------------------------------------------------------- */
 /*                               utilities                                    */
 /* -------------------------------------------------------------------------- */
-
-func contains(ss []string, s string) bool {
-	for _, v := range ss {
-		if v == s {
-			return true
-		}
-	}
-	return false
-}
 
 func GenerateAccessKeyID() (string, error) {
 	return randomString(20, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
