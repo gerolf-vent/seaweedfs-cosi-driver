@@ -97,7 +97,7 @@ func NewProvisionerServer(prov, filerEP, endpoint, region string, opt grpc.DialO
 
 // withFilerClient opens a short-lived conn, executes fn, closes conn.
 func (s *provisionerServer) withFilerClient(ctx context.Context, fn func(filer_pb.SeaweedFilerClient) error) error {
-	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // hard cap
+	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	conn, cli, err := createFilerClient(dialCtx, s.filerEndpoint, s.grpcDialOption)
