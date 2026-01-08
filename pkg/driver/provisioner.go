@@ -400,42 +400,12 @@ func (s *provisionerServer) DriverGrantBucketAccess(ctx context.Context, req *co
 	accessKey, _ := GenerateAccessKeyID()
 	secretKey, _ := GenerateSecretAccessKey()
 
-	// read-modify-write IAM configuration
-	var cfgBuf bytes.Buffer
-	if err := s.readS3Configuration(ctx, &cfgBuf); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	cfg := &iam_pb.S3ApiConfiguration{}
-	if cfgBuf.Len() > 0 {
-		if err := filer.ParseS3ConfigurationFromBytes(cfgBuf.Bytes(), cfg); err != nil {
-			return nil, status.Error(codes.Internal, err.Error())
-		}
-	}
-
-	// ensure identity exists
-	var id *iam_pb.Identity
-	for _, i := range cfg.Identities {
-		if i.Name == user {
-			id = i
-			break
-		}
-	}
-	if id == nil {
-		id = &iam_pb.Identity{Name: user}
-		cfg.Identities = append(cfg.Identities, id)
-	}
-	id.Credentials = append(id.Credentials, &iam_pb.Credential{AccessKey: accessKey, SecretKey: secretKey})
+	var actions []string
 	for _, a := range []string{"Read", "Write", "List", "Tagging"} {
-		action := fmt.Sprintf("%s:%s", a, bucket)
-		if !contains(id.Actions, action) {
-			id.Actions = append(id.Actions, action)
-		}
+		actions = append(actions, fmt.Sprintf("%s:%s", a, bucket))
 	}
 
-	// write back
-	cfgBuf.Reset()
-	filer.ProtoToText(&cfgBuf, cfg)
-	if err := s.saveS3Configuration(ctx, cfgBuf.Bytes()); err != nil {
+	if err := s.configureS3Access(ctx, user, accessKey, secretKey, actions, false); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
@@ -459,7 +429,7 @@ func (s *provisionerServer) DriverRevokeBucketAccess(ctx context.Context, req *c
 	if user == "" {
 		return nil, status.Error(codes.InvalidArgument, "user empty")
 	}
-	if err := s.revokeBucketAccess(ctx, user); err != nil {
+	if err := s.configureS3Access(ctx, user, "", "", nil, true); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	klog.InfoS("revoked bucket access", "user", user, "bucket", req.GetBucketId())
@@ -470,62 +440,50 @@ func (s *provisionerServer) DriverRevokeBucketAccess(ctx context.Context, req *c
 /*                          IAM read / write helpers                          */
 /* -------------------------------------------------------------------------- */
 
-func (s *provisionerServer) readS3Configuration(ctx context.Context, buf *bytes.Buffer) error {
-	return s.withFilerClient(ctx, func(c filer_pb.SeaweedFilerClient) error {
-		resp, err := c.LookupDirectoryEntry(ctx, &filer_pb.LookupDirectoryEntryRequest{
-			Directory: filer.IamConfigDirectory,
-			Name:      filer.IamIdentityFile,
-		})
-		if err != nil && !strings.Contains(err.Error(), "no entry is found") {
+func (s *provisionerServer) readS3Configuration(ctx context.Context) (*iam_pb.S3ApiConfiguration, error) {
+	cfg := &iam_pb.S3ApiConfiguration{}
+	err := s.withFilerClient(ctx, func(client filer_pb.SeaweedFilerClient) error {
+		data, err := filer.ReadInsideFiler(
+			client,
+			filer.IamConfigDirectory,
+			filer.IamIdentityFile,
+		)
+		if errors.Is(err, filer_pb.ErrNotFound) || len(data) == 0 {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read %s/%s: %v", filer.IamConfigDirectory, filer.IamIdentityFile, err)
+		}
+		if err := filer.ParseS3ConfigurationFromBytes(data, cfg); err != nil {
 			return err
 		}
-		if resp != nil && resp.Entry != nil && resp.Entry.Content != nil {
-			buf.Write(resp.Entry.Content)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func (s *provisionerServer) saveS3Configuration(ctx context.Context, data []byte) error {
+	return s.withFilerClient(ctx, func(client filer_pb.SeaweedFilerClient) error {
+		err := filer.SaveInsideFiler(
+			client,
+			filer.IamConfigDirectory,
+			filer.IamIdentityFile,
+			data,
+		)
+		if err != nil {
+			return fmt.Errorf("save %s/%s: %v", filer.IamConfigDirectory, filer.IamIdentityFile, err)
 		}
 		return nil
 	})
 }
 
-func (s *provisionerServer) saveS3Configuration(ctx context.Context, data []byte) error {
-	return s.withFilerClient(ctx, func(c filer_pb.SeaweedFilerClient) error {
-		_, err := c.UpdateEntry(ctx, &filer_pb.UpdateEntryRequest{
-			Directory: filer.IamConfigDirectory,
-			Entry: &filer_pb.Entry{
-				Name:        filer.IamIdentityFile,
-				Content:     data,
-				IsDirectory: false,
-			},
-		})
-		if err == nil || !strings.Contains(err.Error(), "no entry is found") {
-			return err
-		}
-		_, err = c.CreateEntry(ctx, &filer_pb.CreateEntryRequest{
-			Directory: filer.IamConfigDirectory,
-			Entry: &filer_pb.Entry{
-				Name:        filer.IamIdentityFile,
-				Content:     data,
-				IsDirectory: false,
-			},
-		})
-		return err
-	})
-}
-
-func (s *provisionerServer) revokeBucketAccess(ctx context.Context, user string) error {
-	return s.configureS3Access(ctx, user, "", "", nil, true)
-}
-
 func (s *provisionerServer) configureS3Access(ctx context.Context, user, ak, sk string, actions []string, del bool) error {
-	var buf bytes.Buffer
-	if err := s.readS3Configuration(ctx, &buf); err != nil {
+	cfg, err := s.readS3Configuration(ctx)
+	if err != nil {
 		return err
-	}
-
-	cfg := &iam_pb.S3ApiConfiguration{}
-	if buf.Len() > 0 {
-		if err := filer.ParseS3ConfigurationFromBytes(buf.Bytes(), cfg); err != nil {
-			return err
-		}
 	}
 
 	// update cfg …
@@ -551,14 +509,14 @@ func (s *provisionerServer) configureS3Access(ctx context.Context, user, ak, sk 
 			id.Credentials = append(id.Credentials, &iam_pb.Credential{AccessKey: ak, SecretKey: sk})
 		}
 		for _, a := range actions {
-			if !contains(id.Actions, a) {
+			if !slices.Contains(id.Actions, a) {
 				id.Actions = append(id.Actions, a)
 			}
 		}
 	}
 
-	buf.Reset()
-	filer.ProtoToText(&buf, cfg)
+	buf := bytes.NewBuffer(nil)
+	filer.ProtoToText(buf, cfg)
 	return s.saveS3Configuration(ctx, buf.Bytes())
 }
 
