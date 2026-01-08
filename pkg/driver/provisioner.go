@@ -144,73 +144,30 @@ func (s *provisionerServer) deleteBucket(ctx context.Context, id string) error {
 	})
 }
 
-func (s *provisionerServer) createBucketWithParameters(ctx context.Context, name string, parameters map[string]string) error {
+type bucketParameters struct {
+	Replication       string
+	DiskType          string
+	TTL               string
+	VolumeGrowthCount uint32
+	DataCenter        string
+	Rack              string
+	DataNode          string
+}
+
+func (bp *bucketParameters) IsEmpty() bool {
+	return bp.Replication == "" &&
+		bp.DiskType == "" &&
+		bp.TTL == "" &&
+		bp.VolumeGrowthCount == 0 &&
+		bp.DataCenter == "" &&
+		bp.Rack == "" &&
+		bp.DataNode == ""
+}
+
+func (s *provisionerServer) createBucketWithParameters(ctx context.Context, name string, parameters bucketParameters) error {
 	// Fast path: no parameters
-	if len(parameters) == 0 {
+	if parameters.IsEmpty() {
 		return s.createBucket(ctx, name)
-	}
-
-	// Read and validate parameters
-	var replication, diskType, ttl string
-	var volumeGrowthCount uint32
-	var dataCenter, rack, dataNode string
-
-	if paramReplication, ok := parameters[parameterPrefix+"replication"]; ok {
-		if !replicationParameterRegex.MatchString(paramReplication) {
-			klog.ErrorS(nil, "invalid replication parameter", "value", paramReplication, "bucket", name)
-			return fmt.Errorf("invalid replication parameter: %q (must be empty or 3 digits like '001', '210', '100')", replication)
-		}
-		replication = paramReplication
-	}
-
-	if paramDiskType, ok := parameters[parameterPrefix+"diskType"]; ok {
-		if !diskTypeParameterRegex.MatchString(paramDiskType) {
-			klog.ErrorS(nil, "invalid diskType parameter", "value", paramDiskType, "bucket", name)
-			return fmt.Errorf("invalid diskType parameter: %q (only lower-case alphanumerical characters allowed)", replication)
-		}
-		diskType = paramDiskType
-	}
-
-	if paramTTL, ok := parameters[parameterPrefix+"ttl"]; ok {
-		if !ttlParameterRegex.MatchString(paramTTL) {
-			klog.ErrorS(nil, "invalid ttl parameter", "value", paramTTL, "bucket", name)
-			return fmt.Errorf("invalid ttl parameter: %q (must be a number followed by m, h, d, w, M, or y)", paramTTL)
-		}
-		ttl = paramTTL
-	}
-
-	if paramVGC, ok := parameters[parameterPrefix+"volumeGrowthCount"]; ok {
-		var vgc uint64
-		_, err := fmt.Sscanf(paramVGC, "%d", &vgc)
-		if err != nil || vgc > 65535 {
-			klog.ErrorS(err, "invalid volumeGrowthCount parameter", "value", paramVGC, "bucket", name)
-			return fmt.Errorf("invalid volumeGrowthCount parameter: %q (must be a number between 0 and 65535)", paramVGC)
-		}
-		volumeGrowthCount = uint32(vgc)
-	}
-
-	if paramDC, ok := parameters[parameterPrefix+"dataCenter"]; ok {
-		if !safeNameRegex.MatchString(paramDC) {
-			klog.ErrorS(nil, "invalid dataCenter parameter", "value", paramDC, "bucket", name)
-			return fmt.Errorf("invalid dataCenter parameter: %q (only alphanumerical characters, dot, underscore, hyphen allowed, max length 253)", paramDC)
-		}
-		dataCenter = paramDC
-	}
-
-	if paramRack, ok := parameters[parameterPrefix+"rack"]; ok {
-		if !safeNameRegex.MatchString(paramRack) {
-			klog.ErrorS(nil, "invalid rack parameter", "value", paramRack, "bucket", name)
-			return fmt.Errorf("invalid rack parameter: %q (only alphanumerical characters, dot, underscore, hyphen allowed, max length 253)", paramRack)
-		}
-		rack = paramRack
-	}
-
-	if paramDN, ok := parameters[parameterPrefix+"dataNode"]; ok {
-		if !safeNameRegex.MatchString(paramDN) {
-			klog.ErrorS(nil, "invalid dataNode parameter", "value", paramDN, "bucket", name)
-			return fmt.Errorf("invalid dataNode parameter: %q (only alphanumerical characters, dot, underscore, hyphen allowed, max length 253)", paramDN)
-		}
-		dataNode = paramDN
 	}
 
 	// Create PathConf for this bucket
@@ -219,13 +176,13 @@ func (s *provisionerServer) createBucketWithParameters(ctx context.Context, name
 	pathConf := &filer_pb.FilerConf_PathConf{
 		LocationPrefix:    bucketPath,
 		Collection:        name,
-		Replication:       replication,
-		DiskType:          diskType,
-		Ttl:               ttl,
-		VolumeGrowthCount: volumeGrowthCount,
-		DataCenter:        dataCenter,
-		Rack:              rack,
-		DataNode:          dataNode,
+		Replication:       parameters.Replication,
+		DiskType:          parameters.DiskType,
+		Ttl:               parameters.TTL,
+		VolumeGrowthCount: parameters.VolumeGrowthCount,
+		DataCenter:        parameters.DataCenter,
+		Rack:              parameters.Rack,
+		DataNode:          parameters.DataNode,
 	}
 
 	// Sync PathConf to filer.conf
@@ -247,12 +204,11 @@ func (s *provisionerServer) createBucketWithParameters(ctx context.Context, name
 
 func (s *provisionerServer) readFilerConf(client filer_pb.SeaweedFilerClient) (*filer.FilerConf, error) {
 	data, err := filer.ReadInsideFiler(client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName)
-	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
-		return nil, fmt.Errorf("read %s/%s: %v", filer.DirectoryEtcSeaweedFS, filer.FilerConfName, err)
-	}
-
 	if errors.Is(err, filer_pb.ErrNotFound) {
 		return filer.NewFilerConf(), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %s/%s: %v", filer.DirectoryEtcSeaweedFS, filer.FilerConfName, err)
 	}
 
 	fc := filer.NewFilerConf()
@@ -344,8 +300,71 @@ func (s *provisionerServer) removeFilerPathConf(ctx context.Context, bucketName 
 /* -------------------------------------------------------------------------- */
 
 func (s *provisionerServer) DriverCreateBucket(ctx context.Context, req *cosispec.DriverCreateBucketRequest) (*cosispec.DriverCreateBucketResponse, error) {
-	klog.InfoS("creating bucket", "name", req.GetName(), "parameters", req.GetParameters())
-	if err := s.createBucketWithParameters(ctx, req.GetName(), req.GetParameters()); err != nil {
+	name, parameters := req.GetName(), req.GetParameters()
+	klog.InfoS("creating bucket", "name", name, "parameters", parameters)
+
+	// Read and validate parameters
+	bucketParameters := bucketParameters{}
+
+	if paramReplication, ok := parameters[parameterPrefix+"replication"]; ok {
+		if !replicationParameterRegex.MatchString(paramReplication) {
+			klog.ErrorS(nil, "invalid replication parameter", "value", paramReplication, "bucket", name)
+			return nil, status.Error(codes.InvalidArgument, "invalid replication parameter: must be empty or 3 digits like '001', '210', '100'")
+		}
+		bucketParameters.Replication = paramReplication
+	}
+
+	if paramDiskType, ok := parameters[parameterPrefix+"diskType"]; ok {
+		if !diskTypeParameterRegex.MatchString(paramDiskType) {
+			klog.ErrorS(nil, "invalid diskType parameter", "value", paramDiskType, "bucket", name)
+			return nil, status.Error(codes.InvalidArgument, "invalid diskType parameter: only lower-case alphanumerical characters allowed")
+		}
+		bucketParameters.DiskType = paramDiskType
+	}
+
+	if paramTTL, ok := parameters[parameterPrefix+"ttl"]; ok {
+		if !ttlParameterRegex.MatchString(paramTTL) {
+			klog.ErrorS(nil, "invalid ttl parameter", "value", paramTTL, "bucket", name)
+			return nil, status.Error(codes.InvalidArgument, "invalid ttl parameter: must be a number followed by m, h, d, w, M, or y")
+		}
+		bucketParameters.TTL = paramTTL
+	}
+
+	if paramVGC, ok := parameters[parameterPrefix+"volumeGrowthCount"]; ok {
+		var vgc uint64
+		_, err := fmt.Sscanf(paramVGC, "%d", &vgc)
+		if err != nil || vgc > 65535 {
+			klog.ErrorS(err, "invalid volumeGrowthCount parameter", "value", paramVGC, "bucket", name)
+			return nil, status.Error(codes.InvalidArgument, "invalid volumeGrowthCount parameter: must be a number between 0 and 65535")
+		}
+		bucketParameters.VolumeGrowthCount = uint32(vgc)
+	}
+
+	if paramDC, ok := parameters[parameterPrefix+"dataCenter"]; ok {
+		if !safeNameRegex.MatchString(paramDC) {
+			klog.ErrorS(nil, "invalid dataCenter parameter", "value", paramDC, "bucket", name)
+			return nil, status.Error(codes.InvalidArgument, "invalid dataCenter parameter: only alphanumerical characters, dot, underscore, hyphen allowed, max length 253")
+		}
+		bucketParameters.DataCenter = paramDC
+	}
+
+	if paramRack, ok := parameters[parameterPrefix+"rack"]; ok {
+		if !safeNameRegex.MatchString(paramRack) {
+			klog.ErrorS(nil, "invalid rack parameter", "value", paramRack, "bucket", name)
+			return nil, status.Error(codes.InvalidArgument, "invalid rack parameter: only alphanumerical characters, dot, underscore, hyphen allowed, max length 253")
+		}
+		bucketParameters.Rack = paramRack
+	}
+
+	if paramDN, ok := parameters[parameterPrefix+"dataNode"]; ok {
+		if !safeNameRegex.MatchString(paramDN) {
+			klog.ErrorS(nil, "invalid dataNode parameter", "value", paramDN, "bucket", name)
+			return nil, status.Error(codes.InvalidArgument, "invalid dataNode parameter: only alphanumerical characters, dot, underscore, hyphen allowed, max length 253")
+		}
+		bucketParameters.DataNode = paramDN
+	}
+
+	if err := s.createBucketWithParameters(ctx, req.GetName(), bucketParameters); err != nil {
 		klog.ErrorS(err, "create bucket failed")
 		return nil, status.Error(codes.Internal, err.Error())
 	}
